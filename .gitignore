@@ -1,0 +1,16 @@
+# 编译生成的可执行文件
+echo_client
+echo_server
+example
+
+# 编译产生的目标文件目录
+/obj/
+*.o
+
+# IDE 配置（可选）
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db

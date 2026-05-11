@@ -407,13 +407,15 @@ static int send_file_response(int sock, const char *file_path, const char *metho
     return 200;
 }
 
-static int send_post_header(int sock, size_t body_len) {
+static int send_post_raw_echo_response(int sock, const char *request_raw, size_t raw_len) {
     char header[BUF_SIZE];
     int header_len = snprintf(header, sizeof(header),
-        "%sContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n",
-        RESPONSE_200, body_len);
+        "%sContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n\r\n",
+        RESPONSE_200, raw_len);
+
     if (header_len < 0 || (size_t)header_len >= sizeof(header)) return -1;
     if (send_all(sock, header, (size_t)header_len) < 0) return -1;
+    if (raw_len > 0 && send_all(sock, request_raw, raw_len) < 0) return -1;
     return 200;
 }
 
@@ -712,45 +714,6 @@ static int parse_content_length(const char *value, size_t *content_length) {
     return 1;
 }
 
-static int echo_remaining_post_body(int sock, size_t remaining) {
-    char chunk[READ_CHUNK_SIZE];
-
-    while (remaining > 0) {
-        size_t want = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
-        ssize_t n;
-
-        do {
-            n = recv(sock, chunk, want, 0);
-        } while (n < 0 && errno == EINTR);
-
-        if (n <= 0) {
-            logger_error("error", "Failed to read POST body");
-            return -1;
-        }
-        if (send_all(sock, chunk, (size_t)n) < 0) {
-            logger_error("error", "Failed to send POST body");
-            return -1;
-        }
-        remaining -= (size_t)n;
-    }
-    return 0;
-}
-
-static int echo_post_body(int sock, ConnectionBuffer *buffer,
-                          size_t header_len, size_t content_length) {
-    size_t buffered_body = buffer->len > header_len ? buffer->len - header_len : 0;
-    size_t from_buffer = buffered_body < content_length ? buffered_body : content_length;
-
-    if (from_buffer > 0 &&
-        send_all(sock, buffer->data + header_len, from_buffer) < 0) {
-        logger_error("error", "Failed to send buffered POST body");
-        return -1;
-    }
-
-    buffer_consume(buffer, header_len + from_buffer);
-    return echo_remaining_post_body(sock, content_length - from_buffer);
-}
-
 static int handle_single_request(int sock, const char *client_ip,
                                  ConnectionBuffer *buffer, size_t header_len) {
     HashMap *headers = hashmap_create();
@@ -787,19 +750,36 @@ static int handle_single_request(int sock, const char *client_ip,
             buffer_consume(buffer, header_len);
         } else {
             size_t content_length = 0;
-            if (!parse_content_length(hashmap_get(headers, "Content-Length"), &content_length)) {
+            size_t total_len;
+
+            if (!parse_content_length(hashmap_get(headers, "Content-Length"), &content_length) ||
+                content_length > ((size_t)-1) - header_len) {
                 send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
                 response_status = 400;
                 close_after_response = 1;
                 buffer_consume(buffer, header_len);
-            } else {
-                content_len = (long long)content_length;
-                response_status = send_post_header(sock, content_length);
-                if (response_status < 0 ||
-                    echo_post_body(sock, buffer, header_len, content_length) < 0) {
+                goto cleanup;
+            }
+
+            total_len = header_len + content_length;
+            while (buffer->len < total_len) {
+                ssize_t n = buffer_recv(sock, buffer);
+                if (n <= 0) {
+                    logger_error("error", "Failed to read complete POST request");
+                    send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
+                    response_status = 400;
                     close_after_response = 1;
+                    buffer_consume(buffer, buffer->len);
+                    goto cleanup;
                 }
             }
+
+            content_len = (long long)total_len;
+            response_status = send_post_raw_echo_response(sock, buffer->data, total_len);
+            if (response_status < 0) {
+                close_after_response = 1;
+            }
+            buffer_consume(buffer, total_len);
         }
     } else if (status == REQ_NOT_IMPL) {
         send_all(sock, RESPONSE_501, strlen(RESPONSE_501));
@@ -815,6 +795,7 @@ static int handle_single_request(int sock, const char *client_ip,
         close_after_response = 1;
     }
 
+cleanup:
     if (status == REQ_VALID || status == REQ_NOT_IMPL || status == REQ_VERSION_ERR) {
         logger_access(client_ip, method, uri, version, response_status, content_len);
     } else {

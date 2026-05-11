@@ -5,7 +5,9 @@ SRC := $(wildcard $(SRC_DIR)/*.c)
 # all objects
 OBJ := $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o $(OBJ_DIR)/parse.o 
 # all binaries
-BIN := example echo_server echo_client
+#BIN := example echo_server echo_client
+BIN := liso_server echo_client
+#后三周可执行文件应编译为./liso_server
 # C compiler
 CC  := gcc
 # C PreProcessor Flag
@@ -15,7 +17,7 @@ CFLAGS   := -g -Wall -std=c99
 # DEPS = parse.h y.tab.h
 
 default: all
-all : example echo_server echo_client
+all : example liso_server echo_client
 
 example: $(OBJ) $(OBJ_DIR)/example.o
 	$(CC) $^ -o $@
@@ -31,7 +33,7 @@ $(SRC_DIR)/y.tab.c: $(SRC_DIR)/parser.y
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-echo_server: $(OBJ_DIR)/echo_server.o $(OBJ)
+liso_server: $(OBJ_DIR)/echo_server.o $(OBJ)
 	$(CC) -Werror $^ -o $@
 
 echo_client: $(OBJ_DIR)/echo_client.o

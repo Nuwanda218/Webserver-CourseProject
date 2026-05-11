@@ -1,21 +1,62 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp */
 #include <unistd.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>    /* 文件状态检测 */
+#include <fcntl.h>       /* 文件操作 */
+#include <errno.h>       /* 错误处理 */
+#include <time.h>        /* 日志时间 */
+#include <stdarg.h>      /* 可变参数 */
+#include <ctype.h>       /* 字符处理 */
+#include <limits.h>
 
-#define ECHO_PORT 9999
-#define BUF_SIZE 4096
+#define ECHO_PORT 9999           /* echo服务器监听端口 */
+#define BUF_SIZE 8192            /* 缓冲区大小 */
+#define MAX_HEADER_SIZE 8192     /* 头部最大字节数 */
+#define READ_CHUNK_SIZE 4096     /* socket读取块大小 */
+
+/* HTTP响应消息定义 */
+#define RESPONSE_200 "HTTP/1.1 200 OK\r\n"
+#define RESPONSE_400 "HTTP/1.1 400 Bad request\r\n\r\n"
+#define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
+#define RESPONSE_501 "HTTP/1.1 501 Not Implemented\r\n\r\n"
+#define RESPONSE_505 "HTTP/1.1 505 HTTP Version not supported\r\n\r\n"
 
 /* 请求解析状态 */
 typedef enum {
     REQ_VALID,          /* 支持的GET/HEAD/POST方法，格式正确 */
     REQ_NOT_IMPL,       /* 方法不支持（非GET/HEAD/POST） */
-    REQ_BAD             /* 格式错误 */
+    REQ_BAD,            /* 格式错误 */
+    REQ_VERSION_ERR     /* HTTP版本不支持 */
 } req_status;
+
+/* 哈希表条目结构 */
+typedef struct HashMapEntry {
+    char *key;                 /* 键 */
+    char *value;               /* 值 */
+    struct HashMapEntry *next; /* 链表下一个节点 */
+} HashMapEntry;
+
+/* 哈希表结构 */
+typedef struct {
+    HashMapEntry *buckets[256]; /* 256个桶 */
+} HashMap;
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} ConnectionBuffer;
+
+/* 日志文件指针 */
+static FILE *access_log = NULL; /* 访问日志 */
+static FILE *error_log = NULL;  /* 错误日志 */
 
 /* 关闭socket的辅助函数 */
 int close_socket(int sock) {
@@ -31,289 +72,849 @@ void handle_sigpipe(const int sig) {
     (void)sig;  /* 避免未使用参数警告 */
 }
 
-/* 
- * 解析HTTP请求原始报文
+/*
+ * 哈希函数：DJB算法
  * 参数:
- *   raw: 原始请求字符串（不一定以'\0'结尾）
- *   len: 报文长度
+ *   key: 字符串键
+ * 返回值:
+ *   哈希值（0-255）
+ */
+static unsigned int hash_str(const char *key) {
+    unsigned int hash = 0;
+    while (*key) {
+        hash = (hash << 5) + tolower((unsigned char)*key++);
+    }
+    return hash % 256;
+}
+
+/*
+ * 创建哈希表
+ * 返回值:
+ *   哈希表指针
+ */
+static HashMap *hashmap_create(void) {
+    HashMap *map = (HashMap *)malloc(sizeof(HashMap));
+    memset(map, 0, sizeof(HashMap));
+    return map;
+}
+
+/*
+ * 销毁哈希表
+ * 参数:
+ *   map: 哈希表指针
+ */
+static void hashmap_destroy(HashMap *map) {
+    if (!map) return;
+    for (int i = 0; i < 256; i++) {
+        HashMapEntry *entry = map->buckets[i];
+        while (entry) {
+            HashMapEntry *next = entry->next;
+            free(entry->key);
+            free(entry->value);
+            free(entry);
+            entry = next;
+        }
+    }
+    free(map);
+}
+
+/*
+ * 插入或更新键值对
+ * 参数:
+ *   map: 哈希表指针
+ *   key: 键
+ *   value: 值
+ */
+static void hashmap_put(HashMap *map, const char *key, const char *value) {
+    if (!map || !key || !value) return;
+    unsigned int h = hash_str(key);
+    HashMapEntry *entry = map->buckets[h];
+    while (entry) {
+        if (strcasecmp(entry->key, key) == 0) {
+            free(entry->value);
+            entry->value = strdup(value);
+            return;
+        }
+        entry = entry->next;
+    }
+    entry = (HashMapEntry *)malloc(sizeof(HashMapEntry));
+    entry->key = strdup(key);
+    entry->value = strdup(value);
+    entry->next = map->buckets[h];
+    map->buckets[h] = entry;
+}
+
+/*
+ * 根据键查找值
+ * 参数:
+ *   map: 哈希表指针
+ *   key: 键
+ * 返回值:
+ *   值（不存在返回NULL）
+ */
+static const char *hashmap_get(HashMap *map, const char *key) {
+    if (!map || !key) return NULL;
+    unsigned int h = hash_str(key);
+    HashMapEntry *entry = map->buckets[h];
+    while (entry) {
+        if (strcasecmp(entry->key, key) == 0) {
+            return entry->value;
+        }
+        entry = entry->next;
+    }
+    return NULL;
+}
+
+/*
+ * 获取Apache格式时间
+ * 参数:
+ *   buf: 时间字符串缓冲区
+ *   buf_len: 缓冲区长度
+ */
+static void get_apache_time(char *buf, size_t buf_len) {
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    strftime(buf, buf_len, "%d/%b/%Y:%H:%M:%S %z", tm);
+}
+
+/*
+ * 初始化日志系统
+ * 参数:
+ *   access_path: 访问日志文件路径
+ *   error_path: 错误日志文件路径
+ */
+static int logger_init(const char *access_path, const char *error_path) {
+    access_log = fopen(access_path, "a");
+    if (!access_log) {
+        fprintf(stderr, "Failed to open access log: %s\n", access_path);
+        return -1;
+    }
+    error_log = fopen(error_path, "a");
+    if (!error_log) {
+        fprintf(stderr, "Failed to open error log: %s\n", error_path);
+        fclose(access_log);
+        access_log = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * 关闭日志系统
+ */
+static void logger_close(void) {
+    if (access_log) fclose(access_log);
+    if (error_log) fclose(error_log);
+}
+
+/*
+ * 记录访问日志（Apache Common Log Format）
+ * 参数:
+ *   client_ip: 客户端IP
+ *   method: HTTP方法
+ *   uri: 请求URI
+ *   version: HTTP版本
+ *   status: 响应状态码
+ *   bytes: 响应字节数
+ */
+static void logger_access(const char *client_ip, const char *method, const char *uri,
+                          const char *version, int status, long long bytes) {
+    if (!access_log) return;
+    char time_str[64];
+    get_apache_time(time_str, sizeof(time_str));
+    fprintf(access_log, "%s - - [%s] \"%s %s %s\" %d %lld\n",
+            client_ip, time_str, method, uri, version, status, bytes);
+    fflush(access_log);
+}
+
+/*
+ * 记录错误日志（Apache Error Log格式）
+ * 参数:
+ *   level: 日志级别（error/warn/info/debug）
+ *   msg: 错误消息
+ */
+static void logger_error(const char *level, const char *msg) {
+    if (!error_log) return;
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%a %b %d %H:%M:%S %Y", tm);
+    fprintf(error_log, "[%s] [%s] %s\n", time_str, level, msg);
+    fflush(error_log);
+}
+
+/* MIME类型映射表 */
+static const char *mime_types[][2] = {
+    {".html", "text/html"}, {".htm", "text/html"}, {".css", "text/css"},
+    {".js", "application/javascript"}, {".png", "image/png"},
+    {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"}, {".gif", "image/gif"},
+    {".txt", "text/plain"}, {NULL, NULL}
+};
+
+/*
+ * 获取文件的MIME类型
+ * 参数:
+ *   path: 文件路径
+ * 返回值:
+ *   MIME类型字符串
+ */
+static const char *get_mime_type(const char *path) {
+    const char *ext = strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+    for (int i = 0; mime_types[i][0]; i++) {
+        if (strcasecmp(ext, mime_types[i][0]) == 0) {
+            return mime_types[i][1];
+        }
+    }
+    return "application/octet-stream";
+}
+
+/*
+ * 将URI解析为静态文件路径。拒绝路径越界和过长路径。
+ */
+static int resolve_path(const char *uri, char *path, size_t path_len) {
+    const char *static_dir = "./static_site";
+    const char *resource = uri;
+    char uri_copy[4096];
+    char *query = NULL;
+    int written;
+
+    if (!uri || uri[0] != '/' || strstr(uri, "..")) {
+        return 0;
+    }
+
+    written = snprintf(uri_copy, sizeof(uri_copy), "%s", uri);
+    if (written < 0 || (size_t)written >= sizeof(uri_copy)) {
+        return 0;
+    }
+
+    query = strchr(uri_copy, '?');
+    if (query) *query = '\0';
+    query = strchr(uri_copy, '#');
+    if (query) *query = '\0';
+
+    if (strcmp(uri_copy, "/") == 0) {
+        resource = "/index.html";
+    } else {
+        resource = uri_copy;
+    }
+
+    written = snprintf(path, path_len, "%s%s", static_dir, resource);
+    return written >= 0 && (size_t)written < path_len;
+}
+
+static void log_file_error(const char *path, const char *what) {
+    char msg[1024];
+    snprintf(msg, sizeof(msg), "%s: %s: %s", what, path ? path : "-", strerror(errno));
+    logger_error("error", msg);
+}
+
+/*
+ * 完整发送数据
+ * 参数:
+ *   sock: socket描述符
+ *   buf: 数据缓冲区
+ *   len: 数据长度
+ * 返回值:
+ *   0: 成功，-1: 失败
+ */
+static int send_all(int sock, const char *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(sock, buf + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        sent += n;
+    }
+    return 0;
+}
+
+/*
+ * 发送文件响应
+ * 参数:
+ *   sock: socket描述符
+ *   file_path: 文件路径
+ *   method: HTTP方法（HEAD不发送body）
+ * 返回值:
+ *   HTTP状态码（200/404），-1表示发送失败
+ */
+static int send_file_response(int sock, const char *file_path, const char *method,
+                              long long *body_bytes) {
+    struct stat st;
+    int fd;
+    const char *mime;
+    char header[BUF_SIZE];
+    int header_len;
+    char buf[READ_CHUNK_SIZE];
+    ssize_t r;
+
+    if (stat(file_path, &st) != 0) {
+        log_file_error(file_path, "stat failed");
+        send_all(sock, RESPONSE_404, strlen(RESPONSE_404));
+        return 404;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        logger_error("error", "requested path is not a regular file");
+        send_all(sock, RESPONSE_404, strlen(RESPONSE_404));
+        return 404;
+    }
+
+    fd = open(file_path, O_RDONLY);
+    if (fd < 0) {
+        log_file_error(file_path, "open failed");
+        send_all(sock, RESPONSE_404, strlen(RESPONSE_404));
+        return 404;
+    }
+
+    mime = get_mime_type(file_path);
+    if (body_bytes) *body_bytes = (long long)st.st_size;
+    header_len = snprintf(header, sizeof(header),
+        "%sContent-Type: %s\r\nContent-Length: %lld\r\n\r\n",
+        RESPONSE_200, mime, (long long)st.st_size);
+    if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
+        close(fd);
+        logger_error("error", "response header too large");
+        return -1;
+    }
+
+    if (send_all(sock, header, (size_t)header_len) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (strcmp(method, "HEAD") == 0) {
+        close(fd);
+        return 200;
+    }
+
+    while ((r = read(fd, buf, sizeof(buf))) > 0) {
+        if (send_all(sock, buf, (size_t)r) < 0) {
+            close(fd);
+            logger_error("error", "Failed to send file content");
+            return -1;
+        }
+    }
+    if (r < 0) {
+        log_file_error(file_path, "read failed");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 200;
+}
+
+static int send_post_header(int sock, size_t body_len) {
+    char header[BUF_SIZE];
+    int header_len = snprintf(header, sizeof(header),
+        "%sContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n",
+        RESPONSE_200, body_len);
+    if (header_len < 0 || (size_t)header_len >= sizeof(header)) return -1;
+    if (send_all(sock, header, (size_t)header_len) < 0) return -1;
+    return 200;
+}
+
+/*
+ * 判断是否保持持久连接
+ * 参数:
+ *   headers: HTTP头部哈希表
+ * 返回值:
+ *   1: 保持连接，0: 关闭连接
+ */
+static int keep_alive(HashMap *headers) {
+    const char *conn = hashmap_get(headers, "Connection");
+    if (conn && strcasecmp(conn, "close") == 0) return 0;
+    return 1;
+}
+
+/*
+ * 解析HTTP请求原始报文（仅解析头部，不处理body）
+ * 参数:
+ *   raw: 原始请求字符串（以'\0'结尾）
+ *   method: 输出方法名
+ *   uri: 输出URI
+ *   version: 输出HTTP版本
+ *   headers: 输出头部哈希表
  * 返回值:
  *   REQ_VALID   : 方法为GET/HEAD/POST，且格式正确
  *   REQ_NOT_IMPL: 方法为其他（如PUT/DELETE等），且请求行格式基本正确
  *   REQ_BAD     : 格式错误（包括空请求、请求行错误、头部错误等）
+ *   REQ_VERSION_ERR: HTTP版本不支持
  */
-    req_status parse_http_request(const char *raw, size_t len) {
-    /* 1. 空请求检测 */
-    if (len == 0) {
-        return REQ_BAD;
+static int method_is_alpha(const char *method) {
+    if (!method || method[0] == '\0') return 0;
+    for (const char *m = method; *m; m++) {
+        if (!isalpha((unsigned char)*m)) return 0;
     }
+    return 1;
+}
 
-    /* 复制一份便于安全处理，并在结尾加'\0' */
-    char buf[BUF_SIZE];
-    if (len >= BUF_SIZE) {
-        len = BUF_SIZE - 1;
+static int header_name_is_valid(const char *name) {
+    if (!name || name[0] == '\0') return 0;
+    for (const char *p = name; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch <= 32 || ch == 127 || ch == ':') return 0;
     }
-    memcpy(buf, raw, len);
-    buf[len] = '\0';
+    return 1;
+}
 
-    char *ptr = buf;
-    
-    /* ---------- 解析请求行 ---------- */
-    /* 查找请求行结尾 "\r\n" */
-    char *request_line_end = strstr(ptr, "\r\n");
-    if (!request_line_end) {
-        /* 没有找到CRLF，格式错误 */
-        return REQ_BAD;
+static int http_version_is_valid(const char *version) {
+    const char *major;
+    const char *dot;
+    const char *minor;
+
+    if (!version || strncmp(version, "HTTP/", 5) != 0) return 0;
+    major = version + 5;
+    dot = strchr(major, '.');
+    if (!dot || dot == major || dot[1] == '\0') return 0;
+    for (const char *p = major; p < dot; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
     }
-    *request_line_end = '\0';   /* 临时截断，便于解析 */
-    
-    char *method = ptr;
-    /* 跳过方法名后找到空格 */
-    char *sp = strchr(method, ' ');
-    if (!sp) {
-        return REQ_BAD;         /* 方法后无空格 */
+    minor = dot + 1;
+    for (const char *p = minor; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
     }
-    *sp = '\0';
-    char *uri = sp + 1;
-    
-    /* 查找URI后的空格 */
-    char *sp2 = strchr(uri, ' ');
-    if (!sp2) {
-        return REQ_BAD;         /* URI后无空格 */
-    }
-    *sp2 = '\0';
-    char *version = sp2 + 1;
-    
-    /* 校验HTTP版本格式: 必须以 "HTTP/" 开头，后面跟数字.数字 */
-    if (strncmp(version, "HTTP/", 5) != 0) {
-        return REQ_BAD;
-    }
-    char *ver_num = version + 5;
-    /* 简单检查是否为 x.y 格式，允许数字和点 */
-    int dot_count = 0;
-    for (char *v = ver_num; *v; v++) {
-        if (*v == '.') dot_count++;
-        else if (*v < '0' || *v > '9') {
-            return REQ_BAD;     /* 版本号包含非法字符 */
-        }
-    }
-    if (dot_count != 1) {
-        return REQ_BAD;         /* 版本号必须为两个数字 */
-    }
-    
-    /* 检查方法名是否只包含字母（简单防御，防止特殊字符） */
-    for (char *m = method; *m; m++) {
-        if (!((*m >= 'A' && *m <= 'Z') || (*m >= 'a' && *m <= 'z'))) {
-            return REQ_BAD;     /* 方法名包含非字母字符 */
-        }
-    }
-    
-    /* 方法名比较（大小写敏感，HTTP标准方法大写） */
-    int supported = 0;
-    if (strcmp(method, "GET") == 0 ||
-        strcmp(method, "HEAD") == 0 ||
-        strcmp(method, "POST") == 0) {
-        supported = 1;
-    }
-    
-    /* 恢复字符串，继续检查头部格式（头部格式错误也要返回400） */
-    /* 将截断的'\0'恢复为原来的分隔符 */
-    *request_line_end = '\r';
-    /* 注意: request_line_end 指向原字符串的'\r'，后面跟'\n' */
-    
-    /* ---------- 检查头部格式 ---------- */
-    char *header_start = request_line_end + 2;  /* 跳过"\r\n" */
-    char *body_start = NULL;
-    
-    /* 查找空行 "\r\n\r\n" 标记头部结束 */
-    char *empty_line = strstr(header_start, "\r\n\r\n");
-    if (!empty_line) {
-        /* 没有找到空行，格式错误 */
-        return REQ_BAD;
-    }
-    body_start = empty_line + 4;
-    
-    /* 检查每个头部字段行: 格式必须是 "Name: value\r\n" */
-    char *line = header_start;
-    while (line < empty_line) {
-        char *line_end = strstr(line, "\r\n");
-        if (!line_end) {
-            return REQ_BAD;     /* 头部行没有以CRLF结尾 */
-        }
-        *line_end = '\0';
-        
-        /* 查找冒号 */
-        char *colon = strchr(line, ':');
-        if (!colon) {
-            return REQ_BAD;     /* 头部字段缺少冒号 */
-        }
-        if (colon == line) {
-            return REQ_BAD;     /* 冒号前没有字段名 */
-        }
-        /* 可选：检查字段名是否包含空格？根据RFC可以包含连字符等，这里不做过多限制 */
-        
-        /* 恢复换行符 */
-        *line_end = '\r';
-        line = line_end + 2;    /* 下一行 */
-    }
-    
-    /* 额外检测：URI不能为空（即方法后直接CRLF） */
-    if (strlen(uri) == 0) {
-        return REQ_BAD;
-    }
-    
-    /* 根据方法支持情况返回结果 */
-    if (supported) {
-        return REQ_VALID;
-    } else {
-        return REQ_NOT_IMPL;
+    return 1;
+}
+
+static void trim_trailing_ows(char *value) {
+    size_t len = strlen(value);
+    while (len > 0 && (value[len - 1] == ' ' || value[len - 1] == '\t')) {
+        value[--len] = '\0';
     }
 }
 
-/* 
- * 构造并发送HTTP响应
- * 参数:
- *   sock: 客户端socket
- *   status: 解析状态
- *   request_raw: 原始请求字符串（仅在REQ_VALID时使用，用于echo）
- *   raw_len: 原始请求长度
- */
-void send_http_response(int sock, req_status status, const char *request_raw, size_t raw_len) {
-    char response_buf[BUF_SIZE * 2];   /* 响应缓冲区足够大 */
-    int response_len = 0;
-    
-    if (status == REQ_VALID) {
-        /* Echo: 返回200 OK，body为完整原始请求报文 */
-        const char *status_line = "HTTP/1.1 200 OK\r\n";
-        const char *content_type = "Content-Type: message/http\r\n";
-        char content_length_header[64];
-        snprintf(content_length_header, sizeof(content_length_header),
-                 "Content-Length: %zu\r\n", raw_len);
-        const char *empty_line = "\r\n";
-        
-        /* 拼接响应头部 */
-        snprintf(response_buf, sizeof(response_buf), "%s%s%s%s",
-                 status_line, content_type, content_length_header, empty_line);
-        response_len = strlen(response_buf);
-        
-        /* 检查剩余空间是否足够容纳body */
-        if (response_len + raw_len < sizeof(response_buf)) {
-            memcpy(response_buf + response_len, request_raw, raw_len);
-            response_len += raw_len;
-        } else {
-            /* 理论上不会发生，因为BUF_SIZE足够大，但如果发生则降级处理 */
-            fprintf(stderr, "Response buffer too small for echo body\n");
-            const char *fallback = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-            send(sock, fallback, strlen(fallback), 0);
-            return;
+static req_status parse_http_request(const char *raw,
+                                     char *method, char *uri, char *version,
+                                     HashMap *headers) {
+    char *buf;
+    char *request_line_end;
+    char *header_start;
+    char *empty_line;
+    char *method_start;
+    char *uri_start;
+    char *version_start;
+    char *sp;
+    char *sp2;
+    size_t line_delim_len = 2;
+
+    if (raw == NULL || raw[0] == '\0') return REQ_BAD;
+
+    buf = strdup(raw);
+    if (!buf) return REQ_BAD;
+
+    request_line_end = strstr(buf, "\r\n");
+    if (!request_line_end) {
+        request_line_end = strchr(buf, '\n');
+        line_delim_len = 1;
+    }
+    if (!request_line_end) {
+        free(buf);
+        return REQ_BAD;
+    }
+    *request_line_end = '\0';
+
+    method_start = buf;
+    if (method_start[0] == ' ' || method_start[0] == '\t') {
+        free(buf);
+        return REQ_BAD;
+    }
+
+    sp = strchr(method_start, ' ');
+    if (!sp) {
+        free(buf);
+        return REQ_BAD;
+    }
+    *sp = '\0';
+
+    uri_start = sp + 1;
+    sp2 = strchr(uri_start, ' ');
+    if (!sp2) {
+        free(buf);
+        return REQ_BAD;
+    }
+    *sp2 = '\0';
+    version_start = sp2 + 1;
+
+    if (method_start[0] == '\0' || uri_start[0] == '\0' || version_start[0] == '\0' ||
+        strchr(version_start, ' ') || strchr(version_start, '\t') ||
+        !method_is_alpha(method_start) || !http_version_is_valid(version_start) ||
+        strlen(method_start) >= 64 || strlen(uri_start) >= 256 || strlen(version_start) >= 64) {
+        free(buf);
+        return REQ_BAD;
+    }
+
+    header_start = request_line_end + line_delim_len;
+    empty_line = strstr(header_start, "\r\n\r\n");
+    if (!empty_line) {
+        empty_line = strstr(header_start, "\n\n");
+    }
+    if (!empty_line) {
+        free(buf);
+        return REQ_BAD;
+    }
+
+    for (char *line = header_start; line < empty_line; ) {
+        char *line_end = strstr(line, "\r\n");
+        size_t delim_len = 2;
+        char *colon;
+        char *value;
+
+        if (!line_end || line_end > empty_line) {
+            line_end = strchr(line, '\n');
+            delim_len = 1;
         }
-    } 
-    else if (status == REQ_NOT_IMPL) {
-        /* 501 Not Implemented */
-        const char *response = "HTTP/1.1 501 Not Implemented\r\n\r\n";
-        response_len = strlen(response);
-        snprintf(response_buf, sizeof(response_buf), "%s", response);
-    } 
-    else { /* REQ_BAD */
-        /* 400 Bad Request */
-        const char *response = "HTTP/1.1 400 Bad Request\r\n\r\n";
-        response_len = strlen(response);
-        snprintf(response_buf, sizeof(response_buf), "%s", response);
+        if (!line_end || line_end > empty_line) {
+            free(buf);
+            return REQ_BAD;
+        }
+
+        *line_end = '\0';
+        colon = strchr(line, ':');
+        if (!colon || colon == line) {
+            free(buf);
+            return REQ_BAD;
+        }
+        *colon = '\0';
+        if (!header_name_is_valid(line)) {
+            free(buf);
+            return REQ_BAD;
+        }
+
+        value = colon + 1;
+        while (*value == ' ' || *value == '\t') value++;
+        trim_trailing_ows(value);
+        hashmap_put(headers, line, value);
+        line = line_end + delim_len;
     }
-    
-    ssize_t sent = send(sock, response_buf, response_len, 0);
-    if (sent != response_len) {
-        fprintf(stderr, "Warning: incomplete send (%zd/%d)\n", sent, response_len);
+
+    strcpy(method, method_start);
+    strcpy(uri, uri_start);
+    strcpy(version, version_start);
+    free(buf);
+
+    if (strcmp(method, "GET") == 0 ||
+        strcmp(method, "HEAD") == 0 ||
+        strcmp(method, "POST") == 0) {
+        if (strcmp(version, "HTTP/1.1") != 0) return REQ_VERSION_ERR;
+        return REQ_VALID;
     }
+    return REQ_NOT_IMPL;
+}
+
+static void buffer_init(ConnectionBuffer *buffer) {
+    buffer->data = NULL;
+    buffer->len = 0;
+    buffer->cap = 0;
+}
+
+static void buffer_free(ConnectionBuffer *buffer) {
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->len = 0;
+    buffer->cap = 0;
+}
+
+static int buffer_reserve(ConnectionBuffer *buffer, size_t needed) {
+    char *new_data;
+    size_t new_cap = buffer->cap ? buffer->cap : BUF_SIZE;
+
+    if (needed <= buffer->cap) return 0;
+    while (new_cap < needed) {
+        if (new_cap > ((size_t)-1) / 2) return -1;
+        new_cap *= 2;
+    }
+
+    new_data = realloc(buffer->data, new_cap);
+    if (!new_data) return -1;
+    buffer->data = new_data;
+    buffer->cap = new_cap;
+    return 0;
+}
+
+static void buffer_consume(ConnectionBuffer *buffer, size_t count) {
+    if (count >= buffer->len) {
+        buffer->len = 0;
+        if (buffer->data) buffer->data[0] = '\0';
+        return;
+    }
+    memmove(buffer->data, buffer->data + count, buffer->len - count);
+    buffer->len -= count;
+    buffer->data[buffer->len] = '\0';
+}
+
+static ssize_t buffer_recv(int sock, ConnectionBuffer *buffer) {
+    char chunk[READ_CHUNK_SIZE];
+    ssize_t n;
+
+    do {
+        n = recv(sock, chunk, sizeof(chunk), 0);
+    } while (n < 0 && errno == EINTR);
+
+    if (n <= 0) return n;
+    if (buffer_reserve(buffer, buffer->len + (size_t)n + 1) < 0) return -1;
+    memcpy(buffer->data + buffer->len, chunk, (size_t)n);
+    buffer->len += (size_t)n;
+    buffer->data[buffer->len] = '\0';
+    return n;
+}
+
+static int find_header_end(ConnectionBuffer *buffer, size_t *header_len) {
+    char *end;
+
+    if (!buffer->data) return 0;
+    end = strstr(buffer->data, "\r\n\r\n");
+    if (end) {
+        *header_len = (size_t)(end - buffer->data) + 4;
+        return 1;
+    }
+    end = strstr(buffer->data, "\n\n");
+    if (end) {
+        *header_len = (size_t)(end - buffer->data) + 2;
+        return 1;
+    }
+    return 0;
+}
+
+static int read_complete_header(int sock, ConnectionBuffer *buffer, size_t *header_len) {
+    while (!find_header_end(buffer, header_len)) {
+        ssize_t n;
+        if (buffer->len > MAX_HEADER_SIZE) return -2;
+        n = buffer_recv(sock, buffer);
+        if (n == 0) return 0;
+        if (n < 0) return -1;
+    }
+    return *header_len > MAX_HEADER_SIZE ? -2 : 1;
+}
+
+static int parse_content_length(const char *value, size_t *content_length) {
+    const unsigned long long limit = (unsigned long long)((size_t)-1);
+    unsigned long long result = 0;
+
+    *content_length = 0;
+    if (!value) return 1;
+    while (*value == ' ' || *value == '\t') value++;
+    if (!isdigit((unsigned char)*value)) return 0;
+
+    while (isdigit((unsigned char)*value)) {
+        unsigned int digit = (unsigned int)(*value - '0');
+        if (result > (limit - digit) / 10) return 0;
+        result = result * 10 + digit;
+        value++;
+    }
+
+    while (*value == ' ' || *value == '\t') value++;
+    if (*value != '\0') return 0;
+    *content_length = (size_t)result;
+    return 1;
+}
+
+static int echo_remaining_post_body(int sock, size_t remaining) {
+    char chunk[READ_CHUNK_SIZE];
+
+    while (remaining > 0) {
+        size_t want = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+        ssize_t n;
+
+        do {
+            n = recv(sock, chunk, want, 0);
+        } while (n < 0 && errno == EINTR);
+
+        if (n <= 0) {
+            logger_error("error", "Failed to read POST body");
+            return -1;
+        }
+        if (send_all(sock, chunk, (size_t)n) < 0) {
+            logger_error("error", "Failed to send POST body");
+            return -1;
+        }
+        remaining -= (size_t)n;
+    }
+    return 0;
+}
+
+static int echo_post_body(int sock, ConnectionBuffer *buffer,
+                          size_t header_len, size_t content_length) {
+    size_t buffered_body = buffer->len > header_len ? buffer->len - header_len : 0;
+    size_t from_buffer = buffered_body < content_length ? buffered_body : content_length;
+
+    if (from_buffer > 0 &&
+        send_all(sock, buffer->data + header_len, from_buffer) < 0) {
+        logger_error("error", "Failed to send buffered POST body");
+        return -1;
+    }
+
+    buffer_consume(buffer, header_len + from_buffer);
+    return echo_remaining_post_body(sock, content_length - from_buffer);
+}
+
+static int handle_single_request(int sock, const char *client_ip,
+                                 ConnectionBuffer *buffer, size_t header_len) {
+    HashMap *headers = hashmap_create();
+    char method[64] = {0}, uri[256] = {0}, version[64] = {0};
+    char *request_header = NULL;
+    req_status status;
+    int response_status = 400;
+    int close_after_response = 0;
+    long long content_len = -1;
+
+    if (!headers) return 0;
+    request_header = malloc(header_len + 1);
+    if (!request_header) {
+        hashmap_destroy(headers);
+        logger_error("error", "Failed to allocate request header");
+        return 0;
+    }
+    memcpy(request_header, buffer->data, header_len);
+    request_header[header_len] = '\0';
+
+    status = parse_http_request(request_header, method, uri, version, headers);
+
+    if (status == REQ_VALID) {
+        if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
+            char file_path[512];
+            if (!resolve_path(uri, file_path, sizeof(file_path))) {
+                logger_error("error", "Rejected unsafe or too long URI");
+                send_all(sock, RESPONSE_404, strlen(RESPONSE_404));
+                response_status = 404;
+            } else {
+                response_status = send_file_response(sock, file_path, method, &content_len);
+                if (response_status < 0) close_after_response = 1;
+            }
+            buffer_consume(buffer, header_len);
+        } else {
+            size_t content_length = 0;
+            if (!parse_content_length(hashmap_get(headers, "Content-Length"), &content_length)) {
+                send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
+                response_status = 400;
+                close_after_response = 1;
+                buffer_consume(buffer, header_len);
+            } else {
+                content_len = (long long)content_length;
+                response_status = send_post_header(sock, content_length);
+                if (response_status < 0 ||
+                    echo_post_body(sock, buffer, header_len, content_length) < 0) {
+                    close_after_response = 1;
+                }
+            }
+        }
+    } else if (status == REQ_NOT_IMPL) {
+        send_all(sock, RESPONSE_501, strlen(RESPONSE_501));
+        response_status = 501;
+        buffer_consume(buffer, header_len);
+    } else if (status == REQ_VERSION_ERR) {
+        send_all(sock, RESPONSE_505, strlen(RESPONSE_505));
+        response_status = 505;
+        buffer_consume(buffer, header_len);
+    } else {
+        send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
+        response_status = 400;
+        close_after_response = 1;
+    }
+
+    if (status == REQ_VALID || status == REQ_NOT_IMPL || status == REQ_VERSION_ERR) {
+        logger_access(client_ip, method, uri, version, response_status, content_len);
+    } else {
+        logger_access(client_ip, "-", "-", "-", response_status, -1);
+    }
+
+    free(request_header);
+    close_after_response = close_after_response || status == REQ_BAD || !keep_alive(headers);
+    hashmap_destroy(headers);
+    return close_after_response ? 0 : 1;
+}
+
+static void process_client_connection(int sock, const char *client_ip) {
+    ConnectionBuffer buffer;
+    int keep_open = 1;
+
+    buffer_init(&buffer);
+    while (keep_open) {
+        size_t header_len = 0;
+        int rc = read_complete_header(sock, &buffer, &header_len);
+        if (rc == 0) break;
+        if (rc < 0) {
+            if (rc == -2) logger_error("error", "Request header too large");
+            else logger_error("error", "Failed to read request header");
+            send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
+            logger_access(client_ip, "-", "-", "-", 400, -1);
+            break;
+        }
+        keep_open = handle_single_request(sock, client_ip, &buffer, header_len);
+    }
+    buffer_free(&buffer);
 }
 
 int main(int argc, char *argv[]) {
     int sock, client_sock;
     struct sockaddr_in addr, cli_addr;
     socklen_t cli_size;
-    char buf[BUF_SIZE];
-    
+
+    /* 初始化日志系统 */
+    logger_init("access.log", "error.log");
+
     /* 忽略SIGPIPE信号 */
     signal(SIGPIPE, handle_sigpipe);
-    
-    fprintf(stdout, "----- Echo Web Server (HTTP/1.1) -----\n");
+
+    fprintf(stdout, "----- Liso Web Server (HTTP/1.1) -----\n");
     fprintf(stdout, "Listening on port %d\n", ECHO_PORT);
-    
+
     /* 创建socket */
     if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1) {
+        logger_error("error", "Failed creating socket");
         fprintf(stderr, "Failed creating socket.\n");
         return EXIT_FAILURE;
     }
-    
+
     /* 设置端口复用 */
     int opt = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        logger_error("error", "Failed setting socket options");
         fprintf(stderr, "Failed setting socket options.\n");
         close_socket(sock);
         return EXIT_FAILURE;
     }
-    
+
     /* 绑定地址和端口 */
     addr.sin_family = AF_INET;
     addr.sin_port = htons(ECHO_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr))) {
-        close_socket(sock);
+        logger_error("error", "Failed binding socket");
         fprintf(stderr, "Failed binding socket.\n");
-        return EXIT_FAILURE;
-    }
-    
-    /* 监听 */
-    if (listen(sock, 5)) {
         close_socket(sock);
-        fprintf(stderr, "Error listening on socket.\n");
         return EXIT_FAILURE;
     }
-    
+
+    /* 监听 */
+    if (listen(sock, 10)) {
+        logger_error("error", "Error listening on socket");
+        fprintf(stderr, "Error listening on socket.\n");
+        close_socket(sock);
+        return EXIT_FAILURE;
+    }
+
     /* 主循环：接受连接并处理 */
     while (1) {
         cli_size = sizeof(cli_addr);
         if ((client_sock = accept(sock, (struct sockaddr *)&cli_addr, &cli_size)) == -1) {
-            /* 发生错误时继续，不退出 */
             perror("accept");
             continue;
         }
-        
-        /* 获取客户端IP地址 */
+
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &cli_addr.sin_addr, client_ip, sizeof(client_ip));
         fprintf(stdout, "Connection from %s:%d\n", client_ip, ntohs(cli_addr.sin_port));
-        
-        /* 读取HTTP请求 */
-        ssize_t n = recv(client_sock, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) {
-            if (n < 0) perror("recv");
-            close_socket(client_sock);
-            continue;
-        }
-        buf[n] = '\0';  /* 添加字符串结束符，便于打印和解析 */
-        
-        /* 打印请求（调试用） */
-        fprintf(stdout, "--- Request (%zd bytes) ---\n%s\n--- End Request ---\n", n, buf);
-        
-        /* 解析请求 */
-        req_status status = parse_http_request(buf, n);
-        
-        /* 根据解析结果发送响应 */
-        if (status == REQ_VALID) {
-            fprintf(stdout, "-> Responding with 200 OK (echo)\n");
-            send_http_response(client_sock, REQ_VALID, buf, n);
-        } else if (status == REQ_NOT_IMPL) {
-            fprintf(stdout, "-> Responding with 501 Not Implemented\n");
-            send_http_response(client_sock, REQ_NOT_IMPL, NULL, 0);
-        } else {
-            fprintf(stdout, "-> Responding with 400 Bad Request\n");
-            send_http_response(client_sock, REQ_BAD, NULL, 0);
-        }
-        
+        process_client_connection(client_sock, client_ip);
+
         close_socket(client_sock);
         fprintf(stdout, "Connection closed.\n\n");
     }
-    
+
     close_socket(sock);
+    logger_close();
     return EXIT_SUCCESS;
 }

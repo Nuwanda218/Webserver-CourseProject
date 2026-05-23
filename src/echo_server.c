@@ -692,6 +692,70 @@ static int read_complete_header(int sock, ConnectionBuffer *buffer, size_t *head
     return *header_len > MAX_HEADER_SIZE ? -2 : 1;
 }
 
+/* 前向声明：用于在下面的 find_complete_request_len 中调用 */
+static int parse_content_length(const char *value, size_t *content_length);
+
+/*
+ * 检查缓冲区中是否存在一个完整的请求（包括可能的 body），
+ * 如果存在返回 1，并通过 header_len/total_len 输出头部长度和总长度；
+ * 如果不完整返回 0；如果 header 中 Content-Length 不合法返回 -1。
+ */
+static int find_complete_request_len(ConnectionBuffer *buffer, size_t *header_len, size_t *total_len) {
+    char *end;
+    size_t sep_len = 0;
+
+    if (!buffer->data) return 0;
+    end = strstr(buffer->data, "\r\n\r\n");
+    if (end) sep_len = 4;
+    else {
+        end = strstr(buffer->data, "\n\n");
+        if (end) sep_len = 2;
+    }
+    if (!end) return 0;
+
+    size_t hlen = (size_t)(end - buffer->data) + sep_len;
+    size_t content_length = 0;
+
+    /* 在头部区间遍历每一行，查找 Content-Length（不区分大小写）并解析 */
+    char *p = buffer->data;
+    char *header_end_ptr = buffer->data + hlen;
+    while (p < header_end_ptr) {
+        char *line_end = strstr(p, "\r\n");
+        size_t delim = 2;
+        if (!line_end || line_end > header_end_ptr) {
+            line_end = strchr(p, '\n');
+            delim = 1;
+        }
+        if (!line_end || line_end > header_end_ptr) break;
+
+        char *colon = memchr(p, ':', (size_t)(line_end - p));
+        if (colon) {
+            size_t name_len = (size_t)(colon - p);
+            if (name_len == sizeof("Content-Length") - 1 &&
+                strncasecmp(p, "Content-Length", name_len) == 0) {
+                /* 获取值并解析 */
+                char valbuf[64];
+                char *valstart = colon + 1;
+                while (valstart < line_end && (*valstart == ' ' || *valstart == '\t')) valstart++;
+                size_t vlen = (size_t)(line_end - valstart);
+                if (vlen >= sizeof(valbuf)) vlen = sizeof(valbuf) - 1;
+                memcpy(valbuf, valstart, vlen);
+                valbuf[vlen] = '\0';
+                size_t tmp_len = 0;
+                if (!parse_content_length(valbuf, &tmp_len)) return -1;
+                content_length = tmp_len;
+                break;
+            }
+        }
+        p = line_end + delim;
+    }
+
+    size_t tlen = hlen + content_length;
+    if (header_len) *header_len = hlen;
+    if (total_len) *total_len = tlen;
+    return buffer->len >= tlen ? 1 : 0;
+}
+
 static int parse_content_length(const char *value, size_t *content_length) {
     const unsigned long long limit = (unsigned long long)((size_t)-1);
     unsigned long long result = 0;
@@ -715,14 +779,15 @@ static int parse_content_length(const char *value, size_t *content_length) {
 }
 
 static int handle_single_request(int sock, const char *client_ip,
-                                 ConnectionBuffer *buffer, size_t header_len) {
+                                 ConnectionBuffer *buffer,
+                                 size_t header_len, size_t total_len) {
     HashMap *headers = hashmap_create();
     char method[64] = {0}, uri[256] = {0}, version[64] = {0};
     char *request_header = NULL;
     req_status status;
     int response_status = 400;
     int close_after_response = 0;
-    long long content_len = -1;
+    long long content_len = -1;   // 用于访问日志的字节数
 
     if (!headers) return 0;
     request_header = malloc(header_len + 1);
@@ -743,59 +808,49 @@ static int handle_single_request(int sock, const char *client_ip,
                 logger_error("error", "Rejected unsafe or too long URI");
                 send_all(sock, RESPONSE_404, strlen(RESPONSE_404));
                 response_status = 404;
+                content_len = 0;   // 响应体长度为0
             } else {
-                response_status = send_file_response(sock, file_path, method, &content_len);
-                if (response_status < 0) close_after_response = 1;
-            }
-            buffer_consume(buffer, header_len);
-        } else {
-            size_t content_length = 0;
-            size_t total_len;
-
-            if (!parse_content_length(hashmap_get(headers, "Content-Length"), &content_length) ||
-                content_length > ((size_t)-1) - header_len) {
-                send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
-                response_status = 400;
-                close_after_response = 1;
-                buffer_consume(buffer, header_len);
-                goto cleanup;
-            }
-
-            total_len = header_len + content_length;
-            while (buffer->len < total_len) {
-                ssize_t n = buffer_recv(sock, buffer);
-                if (n <= 0) {
-                    logger_error("error", "Failed to read complete POST request");
-                    send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
-                    response_status = 400;
+                int ret = send_file_response(sock, file_path, method, &content_len);
+                if (ret < 0) {
+                    response_status = 500; // 内部错误，但实际函数返回 -1
                     close_after_response = 1;
-                    buffer_consume(buffer, buffer->len);
-                    goto cleanup;
+                } else {
+                    response_status = ret;
                 }
             }
-
+        } else { // POST
+            // total_len 已经包含了 header 和 body
             content_len = (long long)total_len;
-            response_status = send_post_raw_echo_response(sock, buffer->data, total_len);
-            if (response_status < 0) {
-                close_after_response = 1;
-            }
-            buffer_consume(buffer, total_len);
+            int ret = send_post_raw_echo_response(sock, buffer->data, total_len);
+            if (ret < 0) close_after_response = 1;
+            else response_status = ret;
         }
     } else if (status == REQ_NOT_IMPL) {
         send_all(sock, RESPONSE_501, strlen(RESPONSE_501));
         response_status = 501;
-        buffer_consume(buffer, header_len);
+        content_len = 0;
     } else if (status == REQ_VERSION_ERR) {
         send_all(sock, RESPONSE_505, strlen(RESPONSE_505));
         response_status = 505;
-        buffer_consume(buffer, header_len);
-    } else {
+        content_len = 0;
+    } else { // REQ_BAD
         send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
         response_status = 400;
-        close_after_response = 1;
+        content_len = 0;
+        // 不再立即设置 close_after_response = 1
     }
 
-cleanup:
+    // 统一消费 total_len 字节（确保移动到下一个请求的开始）
+    if (total_len > 0) {
+        buffer_consume(buffer, total_len);
+    } else {
+        // 如果 total_len == 0（理论上不应该发生，因为 find_complete_request_len 已确保完整），
+        // 则清空整个缓冲区以避免死循环
+        buffer_consume(buffer, buffer->len);
+        close_after_response = 1;  // 无法确定边界，必须关闭连接
+    }
+
+    // 记录访问日志（使用 content_len，对于错误请求可能为 0 或 -1）
     if (status == REQ_VALID || status == REQ_NOT_IMPL || status == REQ_VERSION_ERR) {
         logger_access(client_ip, method, uri, version, response_status, content_len);
     } else {
@@ -803,7 +858,10 @@ cleanup:
     }
 
     free(request_header);
-    close_after_response = close_after_response || status == REQ_BAD || !keep_alive(headers);
+    // 判断是否需要关闭连接（如果之前没有因发送错误强制关闭）
+    if (!close_after_response) {
+        close_after_response = (status == REQ_BAD && total_len == 0) || !keep_alive(headers);
+    }
     hashmap_destroy(headers);
     return close_after_response ? 0 : 1;
 }
@@ -824,7 +882,26 @@ static void process_client_connection(int sock, const char *client_ip) {
             logger_access(client_ip, "-", "-", "-", 400, -1);
             break;
         }
-        keep_open = handle_single_request(sock, client_ip, &buffer, header_len);
+
+        /* 处理缓冲区内所有已完整到达的请求（包含可能的 body） */
+        while (keep_open) {
+            size_t hlen = 0, tlen = 0;
+            int complete = find_complete_request_len(&buffer, &hlen, &tlen);
+            if (complete < 0) {
+                /* Content-Length 解析错误 */
+                logger_error("error", "Invalid Content-Length header");
+                send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
+                logger_access(client_ip, "-", "-", "-", 400, -1);
+                keep_open = 0;
+                break;
+            }
+            if (!complete) break; /* 需要更多数据，回到 read loop */
+
+            /* 此时缓冲区中包含一个完整请求，交给现有处理函数处理，它会消费相应字节 */
+            keep_open = handle_single_request(sock, client_ip, &buffer, hlen, tlen);
+            if (!keep_open) break;
+            /* 继续循环以检查是否还有下一个完整请求 */
+        }
     }
     buffer_free(&buffer);
 }

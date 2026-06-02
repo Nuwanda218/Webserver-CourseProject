@@ -20,6 +20,9 @@
 #define BUF_SIZE 8192            /* 缓冲区大小 */
 #define MAX_HEADER_SIZE 8192     /* 头部最大字节数 */
 #define READ_CHUNK_SIZE 4096     /* socket读取块大小 */
+#define MAX_CLIENTS  FD_SETSIZE   // 通常为 1024
+
+
 
 /* HTTP响应消息定义 */
 #define RESPONSE_200 "HTTP/1.1 200 OK\r\n"
@@ -27,6 +30,24 @@
 #define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
 #define RESPONSE_501 "HTTP/1.1 501 Not Implemented\r\n\r\n"
 #define RESPONSE_505 "HTTP/1.1 505 HTTP Version not supported\r\n\r\n"
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} ConnectionBuffer;
+
+typedef struct {
+    int sock;                     // 客户端 socket，-1 表示空闲
+    ConnectionBuffer buffer;      // 该连接未处理完的数据
+    char ip[INET_ADDRSTRLEN];     // 客户端 IP
+    int keep_alive;               // 期望保持连接（根据 Connection 头部）
+    // 可扩展其他状态
+} Client;
+
+static Client clients[MAX_CLIENTS];
+static fd_set master_set, read_set;
+static int max_fd;                // 当前最大的文件描述符值
 
 /* 请求解析状态 */
 typedef enum {
@@ -48,15 +69,12 @@ typedef struct {
     HashMapEntry *buckets[256]; /* 256个桶 */
 } HashMap;
 
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-} ConnectionBuffer;
-
 /* 日志文件指针 */
 static FILE *access_log = NULL; /* 访问日志 */
 static FILE *error_log = NULL;  /* 错误日志 */
+
+
+
 
 /* 关闭socket的辅助函数 */
 int close_socket(int sock) {
@@ -778,28 +796,46 @@ static int parse_content_length(const char *value, size_t *content_length) {
     return 1;
 }
 
-static int handle_single_request(int sock, const char *client_ip,
-                                 ConnectionBuffer *buffer,
-                                 size_t header_len, size_t total_len) {
+static const char *status_text(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 404: return "Not Found";
+        case 501: return "Not Implemented";
+        case 505: return "HTTP Version Not Supported";
+        default: return "Unknown";
+    }
+}
+
+/*
+ * 处理单个完整请求（不负责缓冲区消费）
+ * 参数:
+ *   sock: 客户端 socket
+ *   client_ip: 客户端 IP 字符串
+ *   request_raw: 完整的 HTTP 请求原始数据（包含头部和 body）
+ *   total_len: request_raw 的长度
+ * 返回值:
+ *   1: 应保持连接（keep-alive）
+ *   0: 应关闭连接
+ */
+static int handle_one_request(int sock, const char *client_ip,
+                              const char *request_raw, size_t total_len) {
     HashMap *headers = hashmap_create();
-    char method[64] = {0}, uri[256] = {0}, version[64] = {0};
-    char *request_header = NULL;
+    char method[64] = {0};
+    char uri[256] = {0};
+    char version[64] = {0};
     req_status status;
     int response_status = 400;
-    int close_after_response = 0;
-    long long content_len = -1;   // 用于访问日志的字节数
+    long long content_len = -1;
+    int keep_alive = 1;          // 默认保持连接（除非明确要求关闭）
 
-    if (!headers) return 0;
-    request_header = malloc(header_len + 1);
-    if (!request_header) {
-        hashmap_destroy(headers);
-        logger_error("error", "Failed to allocate request header");
+    if (!headers) {
+        logger_error("error", "Failed to create headers hashmap");
         return 0;
     }
-    memcpy(request_header, buffer->data, header_len);
-    request_header[header_len] = '\0';
 
-    status = parse_http_request(request_header, method, uri, version, headers);
+    // 解析请求
+    status = parse_http_request(request_raw, method, uri, version, headers);
 
     if (status == REQ_VALID) {
         if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
@@ -808,22 +844,25 @@ static int handle_single_request(int sock, const char *client_ip,
                 logger_error("error", "Rejected unsafe or too long URI");
                 send_all(sock, RESPONSE_404, strlen(RESPONSE_404));
                 response_status = 404;
-                content_len = 0;   // 响应体长度为0
+                content_len = 0;
             } else {
                 int ret = send_file_response(sock, file_path, method, &content_len);
                 if (ret < 0) {
-                    response_status = 500; // 内部错误，但实际函数返回 -1
-                    close_after_response = 1;
+                    response_status = 500;
+                    keep_alive = 0;   // 内部错误，关闭连接
                 } else {
                     response_status = ret;
                 }
             }
         } else { // POST
-            // total_len 已经包含了 header 和 body
             content_len = (long long)total_len;
-            int ret = send_post_raw_echo_response(sock, buffer->data, total_len);
-            if (ret < 0) close_after_response = 1;
-            else response_status = ret;
+            int ret = send_post_raw_echo_response(sock, request_raw, total_len);
+            if (ret < 0) {
+                response_status = 500;
+                keep_alive = 0;
+            } else {
+                response_status = 200;
+            }
         }
     } else if (status == REQ_NOT_IMPL) {
         send_all(sock, RESPONSE_501, strlen(RESPONSE_501));
@@ -837,142 +876,293 @@ static int handle_single_request(int sock, const char *client_ip,
         send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
         response_status = 400;
         content_len = 0;
-        // 不再立即设置 close_after_response = 1
     }
 
-    // 统一消费 total_len 字节（确保移动到下一个请求的开始）
-    if (total_len > 0) {
-        buffer_consume(buffer, total_len);
-    } else {
-        // 如果 total_len == 0（理论上不应该发生，因为 find_complete_request_len 已确保完整），
-        // 则清空整个缓冲区以避免死循环
-        buffer_consume(buffer, buffer->len);
-        close_after_response = 1;  // 无法确定边界，必须关闭连接
-    }
-
-    // 记录访问日志（使用 content_len，对于错误请求可能为 0 或 -1）
+    // 记录访问日志（与原来完全一致）
     if (status == REQ_VALID || status == REQ_NOT_IMPL || status == REQ_VERSION_ERR) {
         logger_access(client_ip, method, uri, version, response_status, content_len);
     } else {
         logger_access(client_ip, "-", "-", "-", response_status, -1);
     }
 
-    free(request_header);
-    // 判断是否需要关闭连接（如果之前没有因发送错误强制关闭）
-    if (!close_after_response) {
-        close_after_response = (status == REQ_BAD && total_len == 0) || !keep_alive(headers);
+    // 决定是否保持连接：检查 Connection 头部，且非严重错误
+    if (response_status != 500 && response_status != 501) {  // 非致命错误可尝试保持
+        const char *conn = hashmap_get(headers, "Connection");
+        if (conn && strcasecmp(conn, "close") == 0) {
+            keep_alive = 0;
+        }
+    } else {
+        keep_alive = 0;   // 500/501 错误通常关闭连接
     }
+
+    printf("[request] fd=%d ip=%s %s %s -> %d %s, %s\n",
+           sock, client_ip,
+           status == REQ_BAD ? "BAD_REQUEST" : method,
+           status == REQ_BAD ? "-" : uri,
+           response_status, status_text(response_status),
+           keep_alive ? "keep-alive" : "closing");
+
     hashmap_destroy(headers);
-    return close_after_response ? 0 : 1;
+    return keep_alive;
 }
 
-static void process_client_connection(int sock, const char *client_ip) {
-    ConnectionBuffer buffer;
-    int keep_open = 1;
 
-    buffer_init(&buffer);
-    while (keep_open) {
-        size_t header_len = 0;
-        int rc = read_complete_header(sock, &buffer, &header_len);
-        if (rc == 0) break;
-        if (rc < 0) {
-            if (rc == -2) logger_error("error", "Request header too large");
-            else logger_error("error", "Failed to read request header");
-            send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
-            logger_access(client_ip, "-", "-", "-", 400, -1);
-            break;
+/* 初始化客户端数组 */
+static void init_clients() {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        clients[i].sock = -1;
+        buffer_init(&clients[i].buffer);
+    }
+    FD_ZERO(&master_set);
+    max_fd = -1;
+}
+
+static int active_client_count(void) {
+    int count = 0;
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].sock != -1) count++;
+    }
+    return count;
+}
+
+/*
+ * 接受新的客户端连接
+ * 参数:
+ *   listen_sock: 监听socket
+ */
+static void accept_new_connection(int listen_sock) {
+    struct sockaddr_in cli_addr;
+    socklen_t cli_len = sizeof(cli_addr);
+    int new_sock = accept(listen_sock, (struct sockaddr*)&cli_addr, &cli_len);
+    if (new_sock < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) perror("accept");
+        return;
+    }
+
+    // 检查是否超过最大连接数
+    int active_count = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].sock != -1) active_count++;
+    }
+    if (active_count >= MAX_CLIENTS) {
+        // 直接拒绝，可发送 503 响应
+        const char *too_busy = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
+        send(new_sock, too_busy, strlen(too_busy), 0);
+        close(new_sock);
+        return;
+    }
+
+    // 设置非阻塞
+    fcntl(new_sock, F_SETFL, O_NONBLOCK);
+
+    // 找到空闲槽位
+    int idx = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].sock == -1) { idx = i; break; }
+    }
+    if (idx == -1) { close(new_sock); return; } // 理论上不会发生
+
+    clients[idx].sock = new_sock;
+    buffer_init(&clients[idx].buffer);
+    inet_ntop(AF_INET, &cli_addr.sin_addr, clients[idx].ip, INET_ADDRSTRLEN);
+    clients[idx].keep_alive = 1;   // 默认持久连接
+
+    FD_SET(new_sock, &master_set);
+    if (new_sock > max_fd) max_fd = new_sock;
+
+    printf("[accept] fd=%d ip=%s:%d added to select set, active_clients=%d, max_fd=%d\n",
+           new_sock, clients[idx].ip, ntohs(cli_addr.sin_port),
+           active_client_count(), max_fd);
+}
+
+/* 
+* 处理客户端读取事件
+* 参数:
+*   fd: 客户端 socket描述符
+*/
+static void handle_client_read(int fd) {
+    // 找到对应的客户端索引
+    int idx = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].sock == fd) { idx = i; break; }
+    }
+    if (idx == -1) {
+        // 异常，移除
+        FD_CLR(fd, &master_set);
+        close(fd);
+        return;
+    }
+
+    Client *client = &clients[idx];
+    char chunk[4096];
+    ssize_t n;
+
+    // 非阻塞读取
+    do {
+        n = recv(fd, chunk, sizeof(chunk), 0);
+    } while (n < 0 && errno == EINTR);
+
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;   // 没有更多数据，等待下次 select
+        }
+        // 读错误
+        goto cleanup;
+    }
+    if (n == 0) {
+        // 客户端关闭连接
+        goto cleanup;
+    }
+
+    // 将新数据追加到缓冲区
+    if (buffer_reserve(&client->buffer, client->buffer.len + n + 1) < 0) {
+        goto cleanup;
+    }
+    memcpy(client->buffer.data + client->buffer.len, chunk, n);
+    client->buffer.len += n;
+    client->buffer.data[client->buffer.len] = '\0';
+
+    // 循环处理缓冲区中的所有完整请求（支持流水线）
+    while (1) {
+        size_t header_len = 0, total_len = 0;
+        int complete = find_complete_request_len(&client->buffer, &header_len, &total_len);
+        if (complete < 0) {
+            // Content-Length 解析错误，返回 400 后关闭连接
+            send_all(fd, RESPONSE_400, strlen(RESPONSE_400));
+            logger_access(client->ip, "-", "-", "-", 400, -1);
+            goto cleanup;
+        }
+        if (complete == 0) {
+            break;   // 还没有完整请求，继续等待更多数据
         }
 
-        /* 处理缓冲区内所有已完整到达的请求（包含可能的 body） */
-        while (keep_open) {
-            size_t hlen = 0, tlen = 0;
-            int complete = find_complete_request_len(&buffer, &hlen, &tlen);
-            if (complete < 0) {
-                /* Content-Length 解析错误 */
-                logger_error("error", "Invalid Content-Length header");
-                send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
-                logger_access(client_ip, "-", "-", "-", 400, -1);
-                keep_open = 0;
-                break;
-            }
-            if (!complete) break; /* 需要更多数据，回到 read loop */
+        // 复制完整请求（原始字节）
+        char *request_raw = malloc(total_len + 1);
+        if (!request_raw) goto cleanup;
+        memcpy(request_raw, client->buffer.data, total_len);
+        request_raw[total_len] = '\0';
 
-            /* 此时缓冲区中包含一个完整请求，交给现有处理函数处理，它会消费相应字节 */
-            keep_open = handle_single_request(sock, client_ip, &buffer, hlen, tlen);
-            if (!keep_open) break;
-            /* 继续循环以检查是否还有下一个完整请求 */
+        // 调用处理函数（该函数会发送响应，并返回是否应保持连接）
+        int keep = handle_one_request(fd, client->ip, request_raw, total_len);
+        free(request_raw);
+
+        // 消费掉已处理的请求
+        buffer_consume(&client->buffer, total_len);
+
+        if (!keep) {
+            // 根据响应决定关闭连接
+            goto cleanup;
         }
     }
-    buffer_free(&buffer);
+    return;
+
+cleanup:
+    // 关闭连接，清理资源
+    close(fd);
+    FD_CLR(fd, &master_set);
+    buffer_free(&client->buffer);
+    client->sock = -1;
+    // 可选：重新计算 max_fd（可简化，跳过）
+    printf("[close] fd=%d ip=%s removed from select set, active_clients=%d\n",
+           fd, client->ip, active_client_count());
 }
+
+
+// static void process_client_connection(int sock, const char *client_ip) {
+//     ConnectionBuffer buffer;
+//     int keep_open = 1;
+
+//     buffer_init(&buffer);
+//     while (keep_open) {
+//         size_t header_len = 0;
+//         int rc = read_complete_header(sock, &buffer, &header_len);
+//         if (rc == 0) break;
+//         if (rc < 0) {
+//             if (rc == -2) logger_error("error", "Request header too large");
+//             else logger_error("error", "Failed to read request header");
+//             send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
+//             logger_access(client_ip, "-", "-", "-", 400, -1);
+//             break;
+//         }
+
+//         /* 处理缓冲区内所有已完整到达的请求（包含可能的 body） */
+//         while (keep_open) {
+//             size_t hlen = 0, tlen = 0;
+//             int complete = find_complete_request_len(&buffer, &hlen, &tlen);
+//             if (complete < 0) {
+//                 /* Content-Length 解析错误 */
+//                 logger_error("error", "Invalid Content-Length header");
+//                 send_all(sock, RESPONSE_400, strlen(RESPONSE_400));
+//                 logger_access(client_ip, "-", "-", "-", 400, -1);
+//                 keep_open = 0;
+//                 break;
+//             }
+//             if (!complete) break; /* 需要更多数据，回到 read loop */
+
+//             /* 此时缓冲区中包含一个完整请求，交给现有处理函数处理，它会消费相应字节 */
+//             keep_open = handle_one_request(sock, client_ip, buffer.data, tlen);
+//             if (!keep_open) break;
+//             /* 继续循环以检查是否还有下一个完整请求 */
+//         }
+//     }
+//     buffer_free(&buffer);
+// }
 
 int main(int argc, char *argv[]) {
-    int sock, client_sock;
-    struct sockaddr_in addr, cli_addr;
-    socklen_t cli_size;
+    int listen_sock;
+    struct sockaddr_in addr;
 
-    /* 初始化日志系统 */
     logger_init("access.log", "error.log");
-
-    /* 忽略SIGPIPE信号 */
     signal(SIGPIPE, handle_sigpipe);
 
-    fprintf(stdout, "----- Liso Web Server (HTTP/1.1) -----\n");
-    fprintf(stdout, "Listening on port %d\n", ECHO_PORT);
+    // 创建监听 socket
+    listen_sock = socket(PF_INET, SOCK_STREAM, 0);
+    if (listen_sock == -1) { /* 错误处理 */ }
 
-    /* 创建socket */
-    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1) {
-        logger_error("error", "Failed creating socket");
-        fprintf(stderr, "Failed creating socket.\n");
-        return EXIT_FAILURE;
-    }
-
-    /* 设置端口复用 */
     int opt = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        logger_error("error", "Failed setting socket options");
-        fprintf(stderr, "Failed setting socket options.\n");
-        close_socket(sock);
-        return EXIT_FAILURE;
-    }
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    /* 绑定地址和端口 */
     addr.sin_family = AF_INET;
     addr.sin_port = htons(ECHO_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr))) {
-        logger_error("error", "Failed binding socket");
-        fprintf(stderr, "Failed binding socket.\n");
-        close_socket(sock);
-        return EXIT_FAILURE;
-    }
+    bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr));
+    listen(listen_sock, 128);   // backlog 可稍大
 
-    /* 监听 */
-    if (listen(sock, 10)) {
-        logger_error("error", "Error listening on socket");
-        fprintf(stderr, "Error listening on socket.\n");
-        close_socket(sock);
-        return EXIT_FAILURE;
-    }
+    // 设置监听 socket 为非阻塞（推荐）
+    fcntl(listen_sock, F_SETFL, O_NONBLOCK);
 
-    /* 主循环：接受连接并处理 */
+    init_clients();
+
+    // 将监听 socket 加入 master_set
+    FD_SET(listen_sock, &master_set);
+    max_fd = listen_sock;
+
+    printf("[server] Liso Web Server ready: select-based concurrency enabled, port=%d\n", ECHO_PORT);
+
     while (1) {
-        cli_size = sizeof(cli_addr);
-        if ((client_sock = accept(sock, (struct sockaddr *)&cli_addr, &cli_size)) == -1) {
-            perror("accept");
-            continue;
+        read_set = master_set;   // select 会修改集合，必须拷贝
+        if (select(max_fd + 1, &read_set, NULL, NULL, NULL) < 0) {
+            if (errno == EINTR) continue;
+            perror("select");
+            break;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &cli_addr.sin_addr, client_ip, sizeof(client_ip));
-        fprintf(stdout, "Connection from %s:%d\n", client_ip, ntohs(cli_addr.sin_port));
-        process_client_connection(client_sock, client_ip);
+        // 处理监听 socket 上的新连接
+        if (FD_ISSET(listen_sock, &read_set)) {
+            accept_new_connection(listen_sock);
+        }
 
-        close_socket(client_sock);
-        fprintf(stdout, "Connection closed.\n\n");
+        // 遍历所有可能的客户端 socket（从 0 到 max_fd）
+        for (int fd = 0; fd <= max_fd; fd++) {
+            if (fd != listen_sock && FD_ISSET(fd, &read_set)) {
+                handle_client_read(fd);
+            }
+        }
     }
 
-    close_socket(sock);
+    // 清理（实际不会走到这里）
+    close(listen_sock);
     logger_close();
-    return EXIT_SUCCESS;
+    return 0;
 }

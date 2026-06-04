@@ -6,7 +6,7 @@ SRC := $(wildcard $(SRC_DIR)/*.c)
 OBJ := $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o $(OBJ_DIR)/parse.o 
 # all binaries
 #BIN := example echo_server echo_client
-BIN := liso_server echo_client
+BIN := liso_server echo_client cgi-bin/login cgi-bin/fail cgi-bin/envdump
 #后三周可执行文件应编译为./liso_server
 # C compiler
 CC  := gcc
@@ -17,7 +17,7 @@ CFLAGS   := -g -Wall -std=c99
 # DEPS = parse.h y.tab.h
 
 default: all
-all : example liso_server echo_client
+all : example liso_server echo_client cgi-bin/login cgi-bin/fail cgi-bin/envdump
 
 example: $(OBJ) $(OBJ_DIR)/example.o
 	$(CC) $^ -o $@
@@ -38,6 +38,15 @@ liso_server: $(OBJ_DIR)/echo_server.o $(OBJ)
 
 echo_client: $(OBJ_DIR)/echo_client.o
 	$(CC) -Werror $^ -o $@
+
+cgi-bin/login: cgi-bin/login.c
+	$(CC) $(CFLAGS) $< -o $@
+
+cgi-bin/fail: cgi-bin/fail.c
+	$(CC) $(CFLAGS) $< -o $@
+
+cgi-bin/envdump: cgi-bin/envdump.c
+	$(CC) $(CFLAGS) $< -o $@
 
 $(OBJ_DIR):
 	mkdir $@

@@ -15,6 +15,7 @@
 #include <stdarg.h>      /* 可变参数 */
 #include <ctype.h>       /* 字符处理 */
 #include <limits.h>
+#include <sys/wait.h>
 
 #define ECHO_PORT 9999           /* echo服务器监听端口 */
 #define BUF_SIZE 8192            /* 缓冲区大小 */
@@ -30,6 +31,9 @@
 #define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
 #define RESPONSE_501 "HTTP/1.1 501 Not Implemented\r\n\r\n"
 #define RESPONSE_505 "HTTP/1.1 505 HTTP Version not supported\r\n\r\n"
+#define RESPONSE_500 "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+#define CGI_TIMEOUT_SEC 5
+#define CGI_MAX_OUTPUT (1024 * 1024)
 
 typedef struct {
     char *data;
@@ -802,10 +806,368 @@ static const char *status_text(int status) {
         case 200: return "OK";
         case 400: return "Bad Request";
         case 404: return "Not Found";
+        case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         case 505: return "HTTP Version Not Supported";
         default: return "Unknown";
     }
+}
+
+static int is_cgi_uri(const char *uri) {
+    return uri && strncmp(uri, "/cgi-bin/", 9) == 0;
+}
+
+static const char *header_or_empty(HashMap *headers, const char *name) {
+    const char *value = hashmap_get(headers, name);
+    return value ? value : "";
+}
+
+static char *make_env_pair(const char *name, const char *value) {
+    size_t len = strlen(name) + strlen(value ? value : "") + 2;
+    char *pair = malloc(len);
+
+    if (!pair) return NULL;
+    snprintf(pair, len, "%s=%s", name, value ? value : "");
+    return pair;
+}
+
+static void free_cgi_env(char **envp, int count) {
+    if (!envp) return;
+    for (int i = 0; i < count; i++) free(envp[i]);
+    free(envp);
+}
+
+static int add_cgi_env(char **envp, int *idx, const char *name, const char *value) {
+    envp[*idx] = make_env_pair(name, value);
+    if (!envp[*idx]) return -1;
+    (*idx)++;
+    return 0;
+}
+
+static int parse_cgi_uri(const char *uri, char *script_name, size_t script_len,
+                         char *path_info, size_t path_len, char *query, size_t query_len,
+                         char *real_path, size_t real_len) {
+    char uri_copy[512];
+    char *query_start;
+    char *path_start;
+    char *extra_path;
+    char *script_base;
+
+    if (!uri || !is_cgi_uri(uri) || strstr(uri, "..")) return 0;
+    if (strlen(uri) >= sizeof(uri_copy)) return 0;
+    strncpy(uri_copy, uri, sizeof(uri_copy) - 1);
+    uri_copy[sizeof(uri_copy) - 1] = '\0';
+
+    query_start = strchr(uri_copy, '?');
+    if (query_start) {
+        *query_start++ = '\0';
+        snprintf(query, query_len, "%s", query_start);
+    } else {
+        if (query_len > 0) query[0] = '\0';
+    }
+
+    path_start = uri_copy + 9;
+    if (*path_start == '\0') return 0;
+    extra_path = strchr(path_start, '/');
+    if (extra_path) {
+        *extra_path = '\0';
+        snprintf(path_info, path_len, "/%s", extra_path + 1);
+    } else {
+        if (path_len > 0) path_info[0] = '\0';
+    }
+
+    script_base = path_start;
+    if (*script_base == '\0') return 0;
+    snprintf(script_name, script_len, "/cgi-bin/%s", script_base);
+    if (snprintf(real_path, real_len, "./cgi-bin/%s", script_base) >= (int)real_len) {
+        return 0;
+    }
+    return 1;
+}
+
+static const char *find_request_body(const char *request_raw, size_t total_len,
+                                     size_t *body_len) {
+    const char *body = strstr(request_raw, "\r\n\r\n");
+    size_t header_len;
+
+    if (body) {
+        body += 4;
+    } else {
+        body = strstr(request_raw, "\n\n");
+        if (!body) {
+            *body_len = 0;
+            return request_raw + total_len;
+        }
+        body += 2;
+    }
+    header_len = (size_t)(body - request_raw);
+    if (header_len > total_len) {
+        *body_len = 0;
+        return request_raw + total_len;
+    }
+    *body_len = total_len - header_len;
+    return body;
+}
+
+static int build_cgi_env(char ***env_out, const char *client_ip, const char *method,
+                         const char *uri, const char *version, HashMap *headers,
+                         const char *script_name, const char *path_info,
+                         const char *query) {
+    char **envp = calloc(22, sizeof(char *));
+    char port_buf[32];
+    int idx = 0;
+
+    if (!envp) return -1;
+    snprintf(port_buf, sizeof(port_buf), "%d", ECHO_PORT);
+    if (add_cgi_env(envp, &idx, "CONTENT_LENGTH", header_or_empty(headers, "Content-Length")) < 0 ||
+        add_cgi_env(envp, &idx, "CONTENT_TYPE", header_or_empty(headers, "Content-Type")) < 0 ||
+        add_cgi_env(envp, &idx, "GATEWAY_INTERFACE", "CGI/1.1") < 0 ||
+        add_cgi_env(envp, &idx, "PATH_INFO", path_info) < 0 ||
+        add_cgi_env(envp, &idx, "QUERY_STRING", query) < 0 ||
+        add_cgi_env(envp, &idx, "REMOTE_ADDR", client_ip) < 0 ||
+        add_cgi_env(envp, &idx, "REQUEST_METHOD", method) < 0 ||
+        add_cgi_env(envp, &idx, "REQUEST_URI", uri) < 0 ||
+        add_cgi_env(envp, &idx, "SCRIPT_NAME", script_name) < 0 ||
+        add_cgi_env(envp, &idx, "SERVER_PORT", port_buf) < 0 ||
+        add_cgi_env(envp, &idx, "SERVER_PROTOCOL", version && *version ? version : "HTTP/1.1") < 0 ||
+        add_cgi_env(envp, &idx, "SERVER_SOFTWARE", "Liso/1.0") < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_ACCEPT", header_or_empty(headers, "Accept")) < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_REFERER", header_or_empty(headers, "Referer")) < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_ACCEPT_ENCODING", header_or_empty(headers, "Accept-Encoding")) < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_ACCEPT_LANGUAGE", header_or_empty(headers, "Accept-Language")) < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_ACCEPT_CHARSET", header_or_empty(headers, "Accept-Charset")) < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_HOST", header_or_empty(headers, "Host")) < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_COOKIE", header_or_empty(headers, "Cookie")) < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_USER_AGENT", header_or_empty(headers, "User-Agent")) < 0 ||
+        add_cgi_env(envp, &idx, "HTTP_CONNECTION", header_or_empty(headers, "Connection")) < 0) {
+        free_cgi_env(envp, idx);
+        return -1;
+    }
+    envp[idx] = NULL;
+    *env_out = envp;
+    return idx;
+}
+
+static int write_all_fd(int fd, const char *buf, size_t len) {
+    size_t sent = 0;
+
+    while (sent < len) {
+        ssize_t n = write(fd, buf + sent, len - sent);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
+static int append_output(char **buf, size_t *len, size_t *cap, const char *chunk, size_t chunk_len) {
+    char *tmp;
+
+    if (*len + chunk_len > CGI_MAX_OUTPUT) return -1;
+    if (*len + chunk_len + 1 > *cap) {
+        size_t new_cap = *cap ? *cap * 2 : 4096;
+        while (new_cap < *len + chunk_len + 1) new_cap *= 2;
+        tmp = realloc(*buf, new_cap);
+        if (!tmp) return -1;
+        *buf = tmp;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, chunk, chunk_len);
+    *len += chunk_len;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
+static int run_cgi_process(const char *real_path, char **envp,
+                           const char *body, size_t body_len,
+                           char **output, size_t *output_len) {
+    int in_pipe[2] = {-1, -1};
+    int out_pipe[2] = {-1, -1};
+    pid_t pid;
+    int status;
+    int env_count = 0;
+    char *argv[2];
+    char *out = NULL;
+    size_t len = 0, cap = 0;
+    time_t deadline;
+    int child_done = 0;
+
+    while (envp && envp[env_count]) env_count++;
+    if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0) goto fail;
+    pid = fork();
+    if (pid < 0) goto fail;
+    if (pid == 0) {
+        char *slash = strrchr(real_path, '/');
+        argv[0] = slash ? slash + 1 : (char *)real_path;
+        argv[1] = NULL;
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        execve(real_path, argv, envp);
+        _exit(127);
+    }
+
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    in_pipe[0] = -1;
+    out_pipe[1] = -1;
+    if (body_len > 0 && write_all_fd(in_pipe[1], body, body_len) < 0) {
+        logger_error("error", "Failed to write CGI request body");
+    }
+    close(in_pipe[1]);
+    in_pipe[1] = -1;
+    fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
+
+    deadline = time(NULL) + CGI_TIMEOUT_SEC;
+    while (!child_done) {
+        fd_set rfds;
+        struct timeval tv;
+        char chunk[4096];
+        int ready;
+
+        if (time(NULL) >= deadline) {
+            logger_error("error", "CGI output timeout");
+            kill(pid, SIGTERM);
+            sleep(1);
+            if (waitpid(pid, &status, WNOHANG) == 0) kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            goto fail;
+        }
+
+        FD_ZERO(&rfds);
+        FD_SET(out_pipe[0], &rfds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        ready = select(out_pipe[0] + 1, &rfds, NULL, NULL, &tv);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            goto fail;
+        }
+        if (ready > 0 && FD_ISSET(out_pipe[0], &rfds)) {
+            while (1) {
+                ssize_t n = read(out_pipe[0], chunk, sizeof(chunk));
+                if (n > 0) {
+                    if (append_output(&out, &len, &cap, chunk, (size_t)n) < 0) goto fail;
+                } else if (n == 0) {
+                    child_done = 1;
+                    break;
+                } else {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == EINTR) continue;
+                    goto fail;
+                }
+            }
+        }
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            child_done = 1;
+        }
+    }
+    while (1) {
+        char chunk[4096];
+        ssize_t n = read(out_pipe[0], chunk, sizeof(chunk));
+        if (n > 0) {
+            if (append_output(&out, &len, &cap, chunk, (size_t)n) < 0) goto fail;
+        } else {
+            break;
+        }
+    }
+    close(out_pipe[0]);
+    out_pipe[0] = -1;
+    if (waitpid(pid, &status, WNOHANG) == 0) waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0)) {
+        logger_error("error", "CGI process exited abnormally");
+        goto fail;
+    }
+    *output = out;
+    *output_len = len;
+    return 0;
+
+fail:
+    if (in_pipe[0] >= 0) close(in_pipe[0]);
+    if (in_pipe[1] >= 0) close(in_pipe[1]);
+    if (out_pipe[0] >= 0) close(out_pipe[0]);
+    if (out_pipe[1] >= 0) close(out_pipe[1]);
+    free(out);
+    (void)env_count;
+    return -1;
+}
+
+static int send_cgi_output(int sock, const char *output, size_t output_len) {
+    const char *default_header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
+    const char *status_header = "HTTP/1.1 200 OK\r\nConnection: close\r\n";
+
+    if (!output) output_len = 0;
+    if (output_len >= 5 && strncmp(output, "HTTP/", 5) == 0) {
+        return send_all(sock, output, output_len);
+    }
+    if ((output_len > 0 && strstr(output, "\r\n\r\n")) ||
+        (output_len > 0 && strstr(output, "\n\n"))) {
+        if (send_all(sock, status_header, strlen(status_header)) < 0) return -1;
+        return send_all(sock, output, output_len);
+    }
+    if (send_all(sock, default_header, strlen(default_header)) < 0) return -1;
+    if (output_len > 0 && send_all(sock, output, output_len) < 0) return -1;
+    return 0;
+}
+
+static int handle_cgi_request(int sock, const char *client_ip, const char *method,
+                              const char *uri, const char *version, HashMap *headers,
+                              const char *request_raw, size_t total_len) {
+    char script_name[256];
+    char path_info[256];
+    char query[1024];
+    char real_path[512];
+    struct stat st;
+    char **envp = NULL;
+    int env_count = 0;
+    const char *body = NULL;
+    size_t body_len = 0;
+    size_t declared_body_len = 0;
+    char *output = NULL;
+    size_t output_len = 0;
+
+    if (!parse_cgi_uri(uri, script_name, sizeof(script_name), path_info, sizeof(path_info),
+                       query, sizeof(query), real_path, sizeof(real_path))) {
+        send_all(sock, RESPONSE_404, strlen(RESPONSE_404));
+        return 404;
+    }
+    if (stat(real_path, &st) != 0 || !S_ISREG(st.st_mode) || access(real_path, X_OK) != 0) {
+        send_all(sock, RESPONSE_404, strlen(RESPONSE_404));
+        return 404;
+    }
+    env_count = build_cgi_env(&envp, client_ip, method, uri, version, headers,
+                              script_name, path_info, query);
+    if (env_count < 0) {
+        logger_error("error", "Failed to build CGI environment");
+        send_all(sock, RESPONSE_500, strlen(RESPONSE_500));
+        return 500;
+    }
+    body = find_request_body(request_raw, total_len, &body_len);
+    if (parse_content_length(header_or_empty(headers, "Content-Length"), &declared_body_len) &&
+        declared_body_len < body_len) {
+        body_len = declared_body_len;
+    }
+    if (strcmp(method, "POST") != 0) body_len = 0;
+
+    if (run_cgi_process(real_path, envp, body, body_len, &output, &output_len) < 0) {
+        free_cgi_env(envp, env_count);
+        send_all(sock, RESPONSE_500, strlen(RESPONSE_500));
+        return 500;
+    }
+    free_cgi_env(envp, env_count);
+    if (send_cgi_output(sock, output, output_len) < 0) {
+        free(output);
+        return 500;
+    }
+    free(output);
+    (void)client_ip;
+    return 200;
 }
 
 /*
@@ -845,7 +1207,12 @@ static int handle_one_request(int sock, const char *client_ip,
     }
 
     if (status == REQ_VALID) {
-        if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
+        if (is_cgi_uri(uri)) {
+            response_status = handle_cgi_request(sock, client_ip, method, uri, version,
+                                                 headers, request_raw, total_len);
+            content_len = -1;
+            keep_alive = 0;
+        } else if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
             char file_path[512];
             if (!resolve_path(uri, file_path, sizeof(file_path))) {
                 logger_error("error", "Rejected unsafe or too long URI");

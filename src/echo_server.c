@@ -360,7 +360,7 @@ static int send_all(int sock, const char *buf, size_t len) {
  *   HTTP状态码（200/404），-1表示发送失败
  */
 static int send_file_response(int sock, const char *file_path, const char *method,
-                              long long *body_bytes) {
+                              int keep_alive, long long *body_bytes) {
     struct stat st;
     int fd;
     const char *mime;
@@ -391,8 +391,9 @@ static int send_file_response(int sock, const char *file_path, const char *metho
     mime = get_mime_type(file_path);
     if (body_bytes) *body_bytes = (long long)st.st_size;
     header_len = snprintf(header, sizeof(header),
-        "%sContent-Type: %s\r\nContent-Length: %lld\r\n\r\n",
-        RESPONSE_200, mime, (long long)st.st_size);
+        "%sContent-Type: %s\r\nContent-Length: %lld\r\nConnection: %s\r\n\r\n",
+        RESPONSE_200, mime, (long long)st.st_size,
+        keep_alive ? "keep-alive" : "close");
     if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
         close(fd);
         logger_error("error", "response header too large");
@@ -836,6 +837,12 @@ static int handle_one_request(int sock, const char *client_ip,
 
     // 解析请求
     status = parse_http_request(request_raw, method, uri, version, headers);
+    if (status == REQ_VALID || status == REQ_NOT_IMPL || status == REQ_VERSION_ERR) {
+        const char *conn = hashmap_get(headers, "Connection");
+        if (conn && strcasecmp(conn, "close") == 0) {
+            keep_alive = 0;
+        }
+    }
 
     if (status == REQ_VALID) {
         if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
@@ -846,7 +853,7 @@ static int handle_one_request(int sock, const char *client_ip,
                 response_status = 404;
                 content_len = 0;
             } else {
-                int ret = send_file_response(sock, file_path, method, &content_len);
+                int ret = send_file_response(sock, file_path, method, keep_alive, &content_len);
                 if (ret < 0) {
                     response_status = 500;
                     keep_alive = 0;   // 内部错误，关闭连接
@@ -886,12 +893,7 @@ static int handle_one_request(int sock, const char *client_ip,
     }
 
     // 决定是否保持连接：检查 Connection 头部，且非严重错误
-    if (response_status != 500 && response_status != 501) {  // 非致命错误可尝试保持
-        const char *conn = hashmap_get(headers, "Connection");
-        if (conn && strcasecmp(conn, "close") == 0) {
-            keep_alive = 0;
-        }
-    } else {
+    if (response_status == 500 || response_status == 501) {
         keep_alive = 0;   // 500/501 错误通常关闭连接
     }
 

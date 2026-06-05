@@ -342,7 +342,7 @@ static int send_all(int sock, const char *buf, size_t len) {
  *   HTTP状态码（200/404），-1表示发送失败
  */
 static int send_file_response(int sock, const char *file_path, const char *method,
-                              long long *body_bytes) {
+                              int keep_open, long long *body_bytes) {
     struct stat st;
     int fd;
     const char *mime;
@@ -373,8 +373,9 @@ static int send_file_response(int sock, const char *file_path, const char *metho
     mime = get_mime_type(file_path);
     if (body_bytes) *body_bytes = (long long)st.st_size;
     header_len = snprintf(header, sizeof(header),
-        "%sContent-Type: %s\r\nContent-Length: %lld\r\n\r\n",
-        RESPONSE_200, mime, (long long)st.st_size);
+        "%sContent-Type: %s\r\nContent-Length: %lld\r\nConnection: %s\r\n\r\n",
+        RESPONSE_200, mime, (long long)st.st_size,
+        keep_open ? "keep-alive" : "close");
     if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
         close(fd);
         logger_error("error", "response header too large");
@@ -800,6 +801,9 @@ static int handle_single_request(int sock, const char *client_ip,
     request_header[header_len] = '\0';
 
     status = parse_http_request(request_header, method, uri, version, headers);
+    if (status == REQ_VALID || status == REQ_NOT_IMPL || status == REQ_VERSION_ERR) {
+        close_after_response = !keep_alive(headers);
+    }
 
     if (status == REQ_VALID) {
         if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
@@ -810,7 +814,7 @@ static int handle_single_request(int sock, const char *client_ip,
                 response_status = 404;
                 content_len = 0;   // 响应体长度为0
             } else {
-                int ret = send_file_response(sock, file_path, method, &content_len);
+                int ret = send_file_response(sock, file_path, method, !close_after_response, &content_len);
                 if (ret < 0) {
                     response_status = 500; // 内部错误，但实际函数返回 -1
                     close_after_response = 1;
@@ -860,7 +864,7 @@ static int handle_single_request(int sock, const char *client_ip,
     free(request_header);
     // 判断是否需要关闭连接（如果之前没有因发送错误强制关闭）
     if (!close_after_response) {
-        close_after_response = (status == REQ_BAD && total_len == 0) || !keep_alive(headers);
+        close_after_response = (status == REQ_BAD && total_len == 0);
     }
     hashmap_destroy(headers);
     return close_after_response ? 0 : 1;
